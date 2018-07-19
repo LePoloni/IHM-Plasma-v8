@@ -1,0 +1,537 @@
+---------------------------------------------------------------------
+-- TITLE: Escalonador
+-- AUTHOR: Leandro Poloni Dantas (leandro.poloni@gmail.com)
+-- DATE CREATED: 09/01/17
+-- FILENAME: scheduler.vhd
+-- PROJECT: Plasma CPU Modificado v4
+-- COPYRIGHT: Software placed into the public domain by the author.
+--    Software 'as is' without warranty.  Author liable for nothing.
+-- DESCRIPTION:
+--    Parte do Microkernel.
+--		Faz a análise e a definição de qual será a próxima tarefa.
+-- MODELO DO TCB:
+--		Address
+--		3 3 2 2 2 2 2 2 2 2 2 2 1 1 1 1 1 1 1 1 1 1 0 0 0 0 0 0 0 0 0 0
+--		1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0
+--		Value          |               |               |
+--		0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 t t t t t x r r r r r 0 0
+--		Legend
+--		t - número da tarefa
+--		r - registrador salvo
+--    x - (0) faixa de registradores, (1) faixa para outros parâmetros
+
+--xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+-- MOVIFICADO:
+-- 10/01/17 - Consegui gerar todos os sinais e montar a árvore binária
+--				  que analisa qual a próxima tarefa.
+-- 18/05/17 - Criei um bit extra LSB na contagem de waits de cada tarefa,
+--				  esse bit vale 0 quando a tarefa está running e 1 quando
+--				  está ready. Isso faz com que, assim que uma tarefa entra em
+--				  running, além de ter sua contagem de waits zerada, possa a
+--				  ser menos prioritária que oura com mesma prioridade porém
+--				  com waits zerado. Isso poermite que após uma tarefa ser
+--				  interrompida e outra assumir a CPU, se ela for bloqueada,
+--				  a tarefa recém interrompida assuma a CPU (task_next).
+-- 24/05/17 - Reativei o funcionamento do scheduler para interpretar e
+--				  testar todas as tarefas.
+--				- Habilitei task_prio e task_state das 32 tarefas
+--xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+---------------------------------------------------------------------
+library ieee;
+use ieee.std_logic_1164.all;
+use work.mlite_pack_mod.all;
+--use ieee.numeric_std.all;		--Novidade
+use IEEE.STD_LOGIC_ARITH.ALL;
+
+entity scheduler is
+	port(	
+			clk          			: in std_logic;
+			reset			     		: in std_logic;
+			wait_flag				: in std_logic;
+			
+			--Configuração e uso do escalonador
+			task_live	 			: in std_logic_vector(31 downto 0);			--Vetor de tarefas (existe/não existe, máx. 32)
+			
+			--Informações para uso do algoritmo
+			--Priodidade (3 bits): níveis de 0 a 7 (o é a maior prioridade)
+			task_pri7_0				: in std_logic_vector(31 downto 0);
+			task_pri15_8			: in std_logic_vector(31 downto 0);
+			task_pri23_16			: in std_logic_vector(31 downto 0);
+			task_pri31_24			: in std_logic_vector(31 downto 0);
+			--Estados (2 bits): 0-Suspensa, 1-Bloqueada, 2-Pronta, 3-Rodando
+			task_state7_0			: in std_logic_vector(15 downto 0);
+			task_state15_8			: in std_logic_vector(15 downto 0);
+			task_state23_16		: in std_logic_vector(15 downto 0);
+			task_state31_24		: in std_logic_vector(15 downto 0);
+			
+			--Próxima tarefa
+			task_next				: out std_logic_vector(4 downto 0)
+			
+			--Teste
+--			teste_out0				: out integer range 0 to (2**30) - 1;
+--			teste_out1				: out integer range 0 to (2**30) - 1;
+--			teste_out2				: out integer range 0 to (2**30) - 1;
+--			teste_out3				: out integer range 0 to (2**30) - 1;
+--			teste_out4				: out integer range 0 to (2**30) - 1;
+--			teste_out5				: out integer range 0 to (2**30) - 1;
+--			teste_out6				: out integer range 0 to (2**30) - 1;
+--			teste_out7				: out integer range 0 to (2**30) - 1;
+
+--			teste_out8				: out std_logic_vector(31 downto 0)
+		 );
+end; --entity scheduler
+
+architecture logic of scheduler is
+	signal task_ativa		: integer range 0 to 31 := 0;		--Tarefa ativa
+--	signal index 			: natural := 0;
+	
+	--Cria array para waits das tarefas (24 bits)
+   --type waits_array is array(natural range 0 to 31) of integer range 0 to (2**24) - 1;
+	--type waits_array is array(natural range 0 to 31) of integer range 0 to (2**23) - 1;
+	--type waits_array is array(natural range 0 to 31) of integer range 0 to (2**16) - 1;
+	type waits_array is array(natural range 0 to 31) of integer range 0 to (2**12) - 1;
+   signal task_waits: waits_array;
+	
+	--Cria array para prioridade das tarefas (3 bits)
+   type prio_array is array(natural range 0 to 31) of std_logic_vector(2 downto 0);
+   signal task_prio : prio_array;
+	
+	--Cria um array para representar o número da tarefa (5 bits)
+   type num_array is array(natural range 0 to 31) of integer range 0 to 31;
+   signal task_num: num_array;
+	
+	--Cria array para estados das tarefas (2 bits)
+   type state_array is array(natural range 0 to 31) of std_logic_vector(1 downto 0);
+   signal task_state : state_array;
+	
+	--Cria um array para representar a tarefa da arvoré binária (32 bits = núm + prio + waits)
+	--type tree_array is array(natural range 0 to 31) of std_logic_vector(31 downto 0);
+	--type tree_array is array(natural range 0 to 31) of std_logic_vector(24 downto 0);
+	type tree_array is array(natural range 0 to 31) of std_logic_vector(20 downto 0);
+   signal task_tree, task_tree2: tree_array;
+	
+--	signal xxx: integer range 0 to 7;
+--	signal vvv: std_ulogic_vector(2 downto 0);
+--	signal sss: unsigned(2 downto 0);
+
+begin  --architecture
+	task_prio(0) <= task_pri7_0(2 downto 0);
+	task_prio(1) <= task_pri7_0(6 downto 4);
+	task_prio(2) <= task_pri7_0(10 downto 8);
+	task_prio(3) <= task_pri7_0(14 downto 12);
+	task_prio(4) <= task_pri7_0(18 downto 16);
+	task_prio(5) <= task_pri7_0(22 downto 20);
+	task_prio(6) <= task_pri7_0(26 downto 24);
+	task_prio(7) <= task_pri7_0(30 downto 28);
+	
+	task_state(0) <= task_state7_0(1 downto 0);
+	task_state(1) <= task_state7_0(3 downto 2);
+	task_state(2) <= task_state7_0(5 downto 4);
+	task_state(3) <= task_state7_0(7 downto 6);
+	task_state(4) <= task_state7_0(9 downto 8);
+	task_state(5) <= task_state7_0(11 downto 10);
+	task_state(6) <= task_state7_0(13 downto 12);
+	task_state(7) <= task_state7_0(15 downto 14);
+	
+	task_prio(8) <= task_pri15_8(2 downto 0);
+	task_prio(9) <= task_pri15_8(6 downto 4);
+	task_prio(10) <= task_pri15_8(10 downto 8);
+	task_prio(11) <= task_pri15_8(14 downto 12);
+	task_prio(12) <= task_pri15_8(18 downto 16);
+	task_prio(13) <= task_pri15_8(22 downto 20);
+	task_prio(14) <= task_pri15_8(26 downto 24);
+	task_prio(15) <= task_pri15_8(30 downto 28);
+	
+	task_state(8) <= task_state15_8(1 downto 0);
+	task_state(9) <= task_state15_8(3 downto 2);
+	task_state(10) <= task_state15_8(5 downto 4);
+	task_state(11) <= task_state15_8(7 downto 6);
+	task_state(12) <= task_state15_8(9 downto 8);
+	task_state(13) <= task_state15_8(11 downto 10);
+	task_state(14) <= task_state15_8(13 downto 12);
+	task_state(15) <= task_state15_8(15 downto 14);
+	
+	task_prio(16) <= task_pri23_16(2 downto 0);
+	task_prio(17) <= task_pri23_16(6 downto 4);
+	task_prio(18) <= task_pri23_16(10 downto 8);
+	task_prio(19) <= task_pri23_16(14 downto 12);
+	task_prio(20) <= task_pri23_16(18 downto 16);
+	task_prio(21) <= task_pri23_16(22 downto 20);
+	task_prio(22) <= task_pri23_16(26 downto 24);
+	task_prio(23) <= task_pri23_16(30 downto 28);
+	
+	task_state(16) <= task_state23_16(1 downto 0);
+	task_state(17) <= task_state23_16(3 downto 2);
+	task_state(18) <= task_state23_16(5 downto 4);
+	task_state(19) <= task_state23_16(7 downto 6);
+	task_state(20) <= task_state23_16(9 downto 8);
+	task_state(21) <= task_state23_16(11 downto 10);
+	task_state(22) <= task_state23_16(13 downto 12);
+	task_state(23) <= task_state23_16(15 downto 14);
+	
+	task_prio(24) <= task_pri31_24(2 downto 0);
+	task_prio(25) <= task_pri31_24(6 downto 4);
+	task_prio(26) <= task_pri31_24(10 downto 8);
+	task_prio(27) <= task_pri31_24(14 downto 12);
+	task_prio(28) <= task_pri31_24(18 downto 16);
+	task_prio(29) <= task_pri31_24(22 downto 20);
+	task_prio(30) <= task_pri31_24(26 downto 24);
+	task_prio(31) <= task_pri31_24(30 downto 28);
+	
+	task_state(24) <= task_state31_24(1 downto 0);
+	task_state(25) <= task_state31_24(3 downto 2);
+	task_state(26) <= task_state31_24(5 downto 4);
+	task_state(27) <= task_state31_24(7 downto 6);
+	task_state(28) <= task_state31_24(9 downto 8);
+	task_state(29) <= task_state31_24(11 downto 10);
+	task_state(30) <= task_state31_24(13 downto 12);
+	task_state(31) <= task_state31_24(15 downto 14);
+	
+	--Controla a quantidade de waits de cada tarefa a cada tick
+	process (reset, wait_flag, task_waits)
+		variable index : natural := 0;
+		variable task_waits_temp: waits_array;
+	begin
+		if reset = '1' then
+			for index in 0 to 31 loop
+				task_waits(index) <= 0;
+			end loop;	
+		elsif rising_edge(wait_flag) then
+			for index in 0 to 31 loop
+--			for index in 0 to 3 loop
+				--Se a tarefa existe				--Se a tarefa está em estado ready
+				if task_live(index) = '1' and task_state(index) = "10" then
+						task_waits(index) <= task_waits(index) + 1;
+				--Senão sempre zera a espera
+				else
+					task_waits(index) <= 0;
+				end if;
+			end loop;
+		end if;
+--		elsif rising_edge(clk) then
+----			for index in 0 to 31 loop
+--			for index in 0 to 3 loop
+--				if wait_flag = '1' then
+--					--Se a tarefa está em estado ready
+--					if task_state(index) = "10" then
+--						task_waits(index) <= task_waits(index) + 1;
+--					--Senão sempre zera a espera
+--					else
+--						task_waits(index) <= 0;
+--					end if;
+--				elsif task_state(index) = "11" or task_state(index)(1) = '0' then
+--					task_waits(index) <= 0;
+--				end if;
+--			end loop;
+--		end if;
+	end process;
+		--Teste
+--		teste_out0 <= task_waits(0);
+--		teste_out1 <= task_waits(1);
+--		teste_out2 <= task_waits(2);
+--		teste_out3 <= task_waits(3);
+--		teste_out4 <= task_waits(4);
+--		teste_out5 <= task_waits(5);
+--		teste_out6 <= task_waits(6);
+--		teste_out7 <= task_waits(7);
+	
+--Teste	
+--	vvv <= "010";
+--	sss <= unsigned(vvv);
+--	xxx <= conv_integer(sss);
+	
+	--Controla quais tarefas são candidatas a ser a próxima tarefa
+	process (clk, task_state, task_waits, task_prio, task_num, task_live)
+		variable index 			: natural := 0;
+	begin
+--		if rising_edge(clk) then	--***24/05 Rever se deve reabilitar o clk para sincronismo
+			for index in 0 to 31 loop
+--			for index in 0 to 3 loop
+				--Se a tarefa está em estado ready ou running
+				--if task_state(index)(1) = '1' then
+				--TESTAR ESSE IF (Perfeito!!! Impede que tarefas mortas durante a execução do programa
+				--sejam executadas.
+				--Se a tarefa existe				--Se a tarefa está em estado ready ou running
+				if task_live(index) = '1' and task_state(index)(1) = '1' then
+					--A tarefa testada será a própria tarefa na árvore binária
+					task_num(index) <= index;
+					--Cria um valor binário correspondente ao núm & prioridade & quant. de ticks de espera
+					--task_tree(index) <= conv_std_logic_vector(task_num(index),5) & task_prio(index) & conv_std_logic_vector(task_waits(index),24);
+					--18/05/17 criei um bit menos significativo que fica zerado para a tarefa running
+					--task_tree(index) <= conv_std_logic_vector(task_num(index),5) & task_prio(index) & conv_std_logic_vector(task_waits(index),16) & (not task_state(index)(1));
+					task_tree(index) <= conv_std_logic_vector(task_num(index),5) & task_prio(index) & conv_std_logic_vector(task_waits(index),12) & (not task_state(index)(1));
+				else
+					--A tarefa testada será a tarefa 0 (idle_task)
+					task_num(index) <= 0;
+					task_tree(index) <= (others => '0');					
+				end if;			
+			end loop;			
+--		end if;
+	end process;
+		
+	--Definição da árvore binária, a tarefa prioritária sempre avança
+	--Próximo tarefa indicada de acordo com as 8 primeiras
+--	task_tree2(0) <= task_tree(0) when task_tree(0)(26 downto 0) > task_tree(1)(26 downto 0) else
+--						  task_tree(1);
+--	task_tree2(1) <= task_tree(2) when task_tree(2)(26 downto 0) > task_tree(3)(26 downto 0) else
+--						  task_tree(3);
+--	task_tree2(2) <= task_tree(4) when task_tree(4)(26 downto 0) > task_tree(5)(26 downto 0) else
+--						  task_tree(5);
+--	task_tree2(3) <= task_tree(6) when task_tree(6)(26 downto 0) > task_tree(7)(26 downto 0) else
+--						  task_tree(7);
+--	
+--	task_tree2(4) <= task_tree2(0) when task_tree2(0)(26 downto 0) > task_tree2(1)(26 downto 0) else
+--						  task_tree2(1);
+--	task_tree2(5) <= task_tree2(2) when task_tree2(2)(26 downto 0) > task_tree2(3)(26 downto 0) else					  
+--						  task_tree2(3);
+--	
+--	task_tree2(6) <= task_tree2(4) when task_tree2(4)(26 downto 0) > task_tree2(5)(26 downto 0) else
+--						  task_tree2(5);
+--	
+--	--Próximo tarefa indicada de acordo com as 8 segundas
+--	task_tree2(7) <= task_tree(8) when task_tree(8)(26 downto 0) > task_tree(9)(26 downto 0) else
+--						  task_tree(9);
+--	task_tree2(8) <= task_tree(10) when task_tree(10)(26 downto 0) > task_tree(11)(26 downto 0) else
+--						  task_tree(11);
+--	task_tree2(9) <= task_tree(12) when task_tree(12)(26 downto 0) > task_tree(13)(26 downto 0) else
+--						  task_tree(13);
+--	task_tree2(10) <= task_tree(14) when task_tree(14)(26 downto 0) > task_tree(15)(26 downto 0) else
+--						  task_tree(15);
+--	
+--	task_tree2(11) <= task_tree2(7) when task_tree2(7)(26 downto 0) > task_tree2(8)(26 downto 0) else
+--						   task_tree2(8);
+--	task_tree2(12) <= task_tree2(9) when task_tree2(9)(26 downto 0) > task_tree2(10)(26 downto 0) else					  
+--						   task_tree2(10);
+--	
+--	task_tree2(13) <= task_tree2(11) when task_tree2(11)(26 downto 0) > task_tree2(12)(26 downto 0) else
+--						   task_tree2(12);
+--	
+--	--Próximo tarefa indicada de acordo com as 8 terceiras
+--	task_tree2(14) <= task_tree(16) when task_tree(16)(26 downto 0) > task_tree(17)(26 downto 0) else
+--							task_tree(17);
+--	task_tree2(15) <= task_tree(18) when task_tree(18)(26 downto 0) > task_tree(19)(26 downto 0) else
+--							task_tree(19);
+--	task_tree2(16) <= task_tree(20) when task_tree(20)(26 downto 0) > task_tree(21)(26 downto 0) else
+--							task_tree(21);
+--	task_tree2(17) <= task_tree(22) when task_tree(22)(26 downto 0) > task_tree(23)(26 downto 0) else
+--							task_tree(23);
+--	
+--	task_tree2(18) <= task_tree2(14) when task_tree2(14)(26 downto 0) > task_tree2(15)(26 downto 0) else
+--							task_tree2(15);
+--	task_tree2(19) <= task_tree2(16) when task_tree2(16)(26 downto 0) > task_tree2(17)(26 downto 0) else					  
+--							task_tree2(17);
+--	
+--	task_tree2(20) <= task_tree2(18) when task_tree2(18)(26 downto 0) > task_tree2(19)(26 downto 0) else
+--							task_tree2(19);
+--	
+--	--Próximo tarefa indicada de acordo com as 8 quartas
+--	task_tree2(21) <= task_tree(24) when task_tree(24)(26 downto 0) > task_tree(25)(26 downto 0) else
+--							task_tree(25);
+--	task_tree2(22) <= task_tree(26) when task_tree(26)(26 downto 0) > task_tree(27)(26 downto 0) else
+--							task_tree(27);
+--	task_tree2(23) <= task_tree(28) when task_tree(28)(26 downto 0) > task_tree(29)(26 downto 0) else
+--							task_tree(29);
+--	task_tree2(24) <= task_tree(30) when task_tree(30)(26 downto 0) > task_tree(31)(26 downto 0) else
+--							task_tree(31);
+--	
+--	task_tree2(25) <= task_tree2(21) when task_tree2(21)(26 downto 0) > task_tree2(22)(26 downto 0) else
+--							task_tree2(22);
+--	task_tree2(26) <= task_tree2(23) when task_tree2(23)(26 downto 0) > task_tree2(24)(26 downto 0) else					  
+--							task_tree2(24);
+--	
+--	task_tree2(27) <= task_tree2(25) when task_tree2(25)(26 downto 0) > task_tree2(26)(26 downto 0) else
+--							task_tree2(26);
+--	
+--	--Próxima tarefa de indicada de acordo com as 4 mais pré-selecionadas
+--	task_tree2(28) <= task_tree2(6) when task_tree2(6)(26 downto 0) > task_tree2(13)(26 downto 0) else
+--							task_tree2(13);
+--	task_tree2(29) <= task_tree2(20) when task_tree2(20)(26 downto 0) > task_tree2(27)(26 downto 0) else					  
+--							task_tree2(27);
+--	
+--	task_tree2(30) <= task_tree2(28) when task_tree2(28)(26 downto 0) > task_tree2(29)(26 downto 0) else
+--							task_tree2(29);
+--
+--
+--	task_next <= task_tree2(30)(31 downto 27);
+--	task_next <= task_tree2(6)(31 downto 27);
+--	task_next <= task_tree2(4)(31 downto 27);
+
+
+--	task_tree2(0) <= task_tree(0) when task_tree(0)(19 downto 0) > task_tree(1)(19 downto 0) else
+--						  task_tree(1);
+--	task_tree2(1) <= task_tree(2) when task_tree(2)(19 downto 0) > task_tree(3)(19 downto 0) else
+--						  task_tree(3);
+--	task_tree2(2) <= task_tree(4) when task_tree(4)(19 downto 0) > task_tree(5)(19 downto 0) else
+--						  task_tree(5);
+--	task_tree2(3) <= task_tree(6) when task_tree(6)(19 downto 0) > task_tree(7)(19 downto 0) else
+--						  task_tree(7);
+--	
+--	task_tree2(4) <= task_tree2(0) when task_tree2(0)(19 downto 0) > task_tree2(1)(19 downto 0) else
+--						  task_tree2(1);
+--	task_tree2(5) <= task_tree2(2) when task_tree2(2)(19 downto 0) > task_tree2(3)(19 downto 0) else					  
+--						  task_tree2(3);
+--	
+--	task_tree2(6) <= task_tree2(4) when task_tree2(4)(19 downto 0) > task_tree2(5)(19 downto 0) else
+--						  task_tree2(5);
+--	
+--	--Próximo tarefa indicada de acordo com as 8 segundas
+--	task_tree2(7) <= task_tree(8) when task_tree(8)(19 downto 0) > task_tree(9)(19 downto 0) else
+--						  task_tree(9);
+--	task_tree2(8) <= task_tree(10) when task_tree(10)(19 downto 0) > task_tree(11)(19 downto 0) else
+--						  task_tree(11);
+--	task_tree2(9) <= task_tree(12) when task_tree(12)(19 downto 0) > task_tree(13)(19 downto 0) else
+--						  task_tree(13);
+--	task_tree2(10) <= task_tree(14) when task_tree(14)(19 downto 0) > task_tree(15)(19 downto 0) else
+--						  task_tree(15);
+--	
+--	task_tree2(11) <= task_tree2(7) when task_tree2(7)(19 downto 0) > task_tree2(8)(19 downto 0) else
+--						   task_tree2(8);
+--	task_tree2(12) <= task_tree2(9) when task_tree2(9)(19 downto 0) > task_tree2(10)(19 downto 0) else					  
+--						   task_tree2(10);
+--	
+--	task_tree2(13) <= task_tree2(11) when task_tree2(11)(19 downto 0) > task_tree2(12)(19 downto 0) else
+--						   task_tree2(12);
+--	
+--	--Próximo tarefa indicada de acordo com as 8 terceiras
+--	task_tree2(14) <= task_tree(16) when task_tree(16)(19 downto 0) > task_tree(17)(19 downto 0) else
+--							task_tree(17);
+--	task_tree2(15) <= task_tree(18) when task_tree(18)(19 downto 0) > task_tree(19)(19 downto 0) else
+--							task_tree(19);
+--	task_tree2(16) <= task_tree(20) when task_tree(20)(19 downto 0) > task_tree(21)(19 downto 0) else
+--							task_tree(21);
+--	task_tree2(17) <= task_tree(22) when task_tree(22)(19 downto 0) > task_tree(23)(19 downto 0) else
+--							task_tree(23);
+--	
+--	task_tree2(18) <= task_tree2(14) when task_tree2(14)(19 downto 0) > task_tree2(15)(19 downto 0) else
+--							task_tree2(15);
+--	task_tree2(19) <= task_tree2(16) when task_tree2(16)(19 downto 0) > task_tree2(17)(19 downto 0) else					  
+--							task_tree2(17);
+--	
+--	task_tree2(20) <= task_tree2(18) when task_tree2(18)(19 downto 0) > task_tree2(19)(19 downto 0) else
+--							task_tree2(19);
+--	
+--	--Próximo tarefa indicada de acordo com as 8 quartas
+--	task_tree2(21) <= task_tree(24) when task_tree(24)(19 downto 0) > task_tree(25)(19 downto 0) else
+--							task_tree(25);
+--	task_tree2(22) <= task_tree(26) when task_tree(26)(19 downto 0) > task_tree(27)(19 downto 0) else
+--							task_tree(27);
+--	task_tree2(23) <= task_tree(28) when task_tree(28)(19 downto 0) > task_tree(29)(19 downto 0) else
+--							task_tree(29);
+--	task_tree2(24) <= task_tree(30) when task_tree(30)(19 downto 0) > task_tree(31)(19 downto 0) else
+--							task_tree(31);
+--	
+--	task_tree2(25) <= task_tree2(21) when task_tree2(21)(19 downto 0) > task_tree2(22)(19 downto 0) else
+--							task_tree2(22);
+--	task_tree2(26) <= task_tree2(23) when task_tree2(23)(19 downto 0) > task_tree2(24)(19 downto 0) else					  
+--							task_tree2(24);
+--	
+--	task_tree2(27) <= task_tree2(25) when task_tree2(25)(19 downto 0) > task_tree2(26)(19 downto 0) else
+--							task_tree2(26);
+--	
+--	--Próxima tarefa de indicada de acordo com as 4 mais pré-selecionadas
+--	task_tree2(28) <= task_tree2(6) when task_tree2(6)(19 downto 0) > task_tree2(13)(19 downto 0) else
+--							task_tree2(13);
+--	task_tree2(29) <= task_tree2(20) when task_tree2(20)(19 downto 0) > task_tree2(27)(19 downto 0) else					  
+--							task_tree2(27);
+--	
+--	task_tree2(30) <= task_tree2(28) when task_tree2(28)(19 downto 0) > task_tree2(29)(19 downto 0) else
+--							task_tree2(29);
+--
+--
+--	task_next <= task_tree2(30)(24 downto 20);
+	
+	
+	
+
+	task_tree2(0) <= task_tree(0) when task_tree(0)(15 downto 0) > task_tree(1)(15 downto 0) else
+						  task_tree(1);
+	task_tree2(1) <= task_tree(2) when task_tree(2)(15 downto 0) > task_tree(3)(15 downto 0) else
+						  task_tree(3);
+	task_tree2(2) <= task_tree(4) when task_tree(4)(15 downto 0) > task_tree(5)(15 downto 0) else
+						  task_tree(5);
+	task_tree2(3) <= task_tree(6) when task_tree(6)(15 downto 0) > task_tree(7)(15 downto 0) else
+						  task_tree(7);
+	
+	task_tree2(4) <= task_tree2(0) when task_tree2(0)(15 downto 0) > task_tree2(1)(15 downto 0) else
+						  task_tree2(1);
+	task_tree2(5) <= task_tree2(2) when task_tree2(2)(15 downto 0) > task_tree2(3)(15 downto 0) else					  
+						  task_tree2(3);
+	
+	task_tree2(6) <= task_tree2(4) when task_tree2(4)(15 downto 0) > task_tree2(5)(15 downto 0) else
+						  task_tree2(5);
+	
+	--Próximo tarefa indicada de acordo com as 8 segundas
+	task_tree2(7) <= task_tree(8) when task_tree(8)(15 downto 0) > task_tree(9)(15 downto 0) else
+						  task_tree(9);
+	task_tree2(8) <= task_tree(10) when task_tree(10)(15 downto 0) > task_tree(11)(15 downto 0) else
+						  task_tree(11);
+	task_tree2(9) <= task_tree(12) when task_tree(12)(15 downto 0) > task_tree(13)(15 downto 0) else
+						  task_tree(13);
+	task_tree2(10) <= task_tree(14) when task_tree(14)(15 downto 0) > task_tree(15)(15 downto 0) else
+						  task_tree(15);
+	
+	task_tree2(11) <= task_tree2(7) when task_tree2(7)(15 downto 0) > task_tree2(8)(15 downto 0) else
+						   task_tree2(8);
+	task_tree2(12) <= task_tree2(9) when task_tree2(9)(15 downto 0) > task_tree2(10)(15 downto 0) else					  
+						   task_tree2(10);
+	
+	task_tree2(13) <= task_tree2(11) when task_tree2(11)(15 downto 0) > task_tree2(12)(15 downto 0) else
+						   task_tree2(12);
+	
+	--Próximo tarefa indicada de acordo com as 8 terceiras
+	task_tree2(14) <= task_tree(16) when task_tree(16)(15 downto 0) > task_tree(17)(15 downto 0) else
+							task_tree(17);
+	task_tree2(15) <= task_tree(18) when task_tree(18)(15 downto 0) > task_tree(19)(15 downto 0) else
+							task_tree(19);
+	task_tree2(16) <= task_tree(20) when task_tree(20)(15 downto 0) > task_tree(21)(15 downto 0) else
+							task_tree(21);
+	task_tree2(17) <= task_tree(22) when task_tree(22)(15 downto 0) > task_tree(23)(15 downto 0) else
+							task_tree(23);
+	
+	task_tree2(18) <= task_tree2(14) when task_tree2(14)(15 downto 0) > task_tree2(15)(15 downto 0) else
+							task_tree2(15);
+	task_tree2(19) <= task_tree2(16) when task_tree2(16)(15 downto 0) > task_tree2(17)(15 downto 0) else					  
+							task_tree2(17);
+	
+	task_tree2(20) <= task_tree2(18) when task_tree2(18)(15 downto 0) > task_tree2(19)(15 downto 0) else
+							task_tree2(19);
+	
+	--Próximo tarefa indicada de acordo com as 8 quartas
+	task_tree2(21) <= task_tree(24) when task_tree(24)(15 downto 0) > task_tree(25)(15 downto 0) else
+							task_tree(25);
+	task_tree2(22) <= task_tree(26) when task_tree(26)(15 downto 0) > task_tree(27)(15 downto 0) else
+							task_tree(27);
+	task_tree2(23) <= task_tree(28) when task_tree(28)(15 downto 0) > task_tree(29)(15 downto 0) else
+							task_tree(29);
+	task_tree2(24) <= task_tree(30) when task_tree(30)(15 downto 0) > task_tree(31)(15 downto 0) else
+							task_tree(31);
+	
+	task_tree2(25) <= task_tree2(21) when task_tree2(21)(15 downto 0) > task_tree2(22)(15 downto 0) else
+							task_tree2(22);
+	task_tree2(26) <= task_tree2(23) when task_tree2(23)(15 downto 0) > task_tree2(24)(15 downto 0) else					  
+							task_tree2(24);
+	
+	task_tree2(27) <= task_tree2(25) when task_tree2(25)(15 downto 0) > task_tree2(26)(15 downto 0) else
+							task_tree2(26);
+	
+	--Próxima tarefa de indicada de acordo com as 4 mais pré-selecionadas
+	task_tree2(28) <= task_tree2(6) when task_tree2(6)(15 downto 0) > task_tree2(13)(15 downto 0) else
+							task_tree2(13);
+	task_tree2(29) <= task_tree2(20) when task_tree2(20)(15 downto 0) > task_tree2(27)(15 downto 0) else					  
+							task_tree2(27);
+	
+	task_tree2(30) <= task_tree2(28) when task_tree2(28)(15 downto 0) > task_tree2(29)(15 downto 0) else
+							task_tree2(29);
+
+
+	task_next <= task_tree2(30)(20 downto 16);
+
+
+	
+	--Teste elementar
+--	task_next <= "00001" when task_state(2) = "11" else "00010";
+
+		--Teste		
+--		teste_out8 <= task_tree2(6);
+	
+end; --architecture logic
